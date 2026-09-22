@@ -1,0 +1,145 @@
+0004 - DNS manager (Android)
+============================
+
+There is no resolv.conf on Android. The manager must set resolver properties directly and must not clobber netd's own view of the network.
+
+concern   : dns-manager-android
+files     : 2
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0004-dns-manager-android.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/net/dns/manager_android.go b/net/dns/manager_android.go
+new file mode 100644
+index 0000000000000..86ed43479ec27
+--- /dev/null
++++ b/net/dns/manager_android.go
+@@ -0,0 +1,111 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build android
++
++package dns
++
++import (
++	"github.com/coreos/go-iptables/iptables"
++	"tailscale.com/control/controlknobs"
++	"tailscale.com/health"
++	"tailscale.com/net/tsaddr"
++	"tailscale.com/types/logger"
++	"tailscale.com/util/eventbus"
++	"tailscale.com/util/syspolicy/policyclient"
++)
++
++type androidManager struct {
++	logf     logger.Logf
++	hijacked bool
++}
++
++func NewOSConfigurator(logf logger.Logf, _ *health.Tracker, _ *eventbus.Bus, _ policyclient.Client, _ *controlknobs.Knobs, _ string) (OSConfigurator, error) {
++	return &androidManager{logf: logf}, nil
++}
++
++func (m *androidManager) SetDNS(cfg OSConfig) error {
++	shouldHijack := len(cfg.Nameservers) > 0
++
++	if shouldHijack && !m.hijacked {
++		// Enable DNS hijacking
++		if err := setDNSRules(false, true); err != nil {
++			m.logf("dns: failed to setup rules: %v", err)
++			return err
++		}
++		if err := setDNSRules(true, true); err != nil {
++			m.logf("dns: ipv6 rules failed (non-fatal): %v", err)
++		}
++		m.hijacked = true
++		m.logf("dns: hijack enabled")
++	} else if !shouldHijack {
++		// Always clean up rules when DNS is disabled, regardless of tracked state
++		if err := setDNSRules(false, false); err != nil {
++			m.logf("dns: failed to remove rules: %v", err)
++		}
++		if err := setDNSRules(true, false); err != nil {
++			m.logf("dns: ipv6 rules removal failed (non-fatal): %v", err)
++		}
++		if m.hijacked {
++			m.hijacked = false
++			m.logf("dns: hijack disabled")
++		}
++	}
++	return nil
++}
++
++func (m *androidManager) SupportsSplitDNS() bool {
++	return false
++}
++
++func (m *androidManager) GetBaseConfig() (OSConfig, error) {
++	return OSConfig{}, nil
++}
++
++func (m *androidManager) Close() error {
++	if m.hijacked {
++		setDNSRules(false, false)
++		setDNSRules(true, false)
++		m.hijacked = false
++		m.logf("dns: hijack disabled")
++	}
++	return nil
++}
++
++func setDNSRules(ipv6 bool, add bool) error {
++	proto := iptables.ProtocolIPv4
++	dnsIP := tsaddr.TailscaleServiceIPString
++	if ipv6 {
++		proto = iptables.ProtocolIPv6
++		dnsIP = tsaddr.TailscaleServiceIPv6String
++	}
++
++	ipt, err := iptables.NewWithProtocol(proto)
++	if err != nil {
++		return err
++	}
++
++	rules := []struct {
++		table string
++		chain string
++		args  []string
++	}{
++		// Redirect local DNS to Tailscale (exclude tun interfaces)
++		{"nat", "OUTPUT", []string{"!", "-o", "tun+", "!", "-d", dnsIP, "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", dnsIP + ":53"}},
++		// Redirect hotspot DNS to Tailscale (exclude tun interfaces)
++		{"nat", "PREROUTING", []string{"!", "-i", "tun+", "-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", dnsIP + ":53"}},
++	}
++
++	for _, rule := range rules {
++		if add {
++			err := ipt.Append(rule.table, rule.chain, rule.args...)
++			if err != nil {
++				return err
++			}
++		} else {
++			ipt.Delete(rule.table, rule.chain, rule.args...)
++		}
++	}
++
++	return nil
++}
+diff --git a/net/dns/manager_default.go b/net/dns/manager_default.go
+index b514a741799a4..24c460b2f5f9f 100644
+--- a/net/dns/manager_default.go
++++ b/net/dns/manager_default.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (!linux || android) && !freebsd && !openbsd && !windows && !darwin && !illumos && !solaris && !plan9
++//go:build !linux && !android && !freebsd && !openbsd && !windows && !darwin && !illumos && !solaris && !plan9
+ 
+ package dns
+ 

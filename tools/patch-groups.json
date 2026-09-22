@@ -1,0 +1,151 @@
+{
+  "source": "research/android-patch.patch",
+  "upstream": {
+    "commit": "d6a741131b0d5010797bd737ca3bd7c02f8cb511",
+    "subject": "feat: android modifications",
+    "author": "Anas <135501348+anasfanani@users.noreply.github.com>",
+    "date": "2026-07-13",
+    "tailscale_range": "v1.98.5 -> v1.98.8",
+    "base_commit": "96b8d62ed1f5d1474b52052c1c0e6a38ca6935b5"
+  },
+  "note": "Regrouped by CONCERN. The source is a single squash; the ten original commits named in its header are not recoverable from it, so these group boundaries are a reviewed regrouping, not a recovery. The split is lossless and machine-checked (see MANIFEST.md).",
+  "groups": [
+    {
+      "slug": "build-and-tooling",
+      "title": "Build & tooling",
+      "why": "The Android build entrypoint and the Go module pins. Nothing compiles without it, so it leads the series.",
+      "files": [
+        ".github/workflows/build_android.yml",
+        "scripts/android.sh",
+        "go.mod",
+        "go.sum"
+      ]
+    },
+    {
+      "slug": "paths-and-runtime-locations",
+      "title": "Paths & runtime locations",
+      "why": "Android has no /var/lib and no writable /etc: daemon state must live under /data/adb. Establishes where the daemon reads and writes before anything else moves.",
+      "files": [
+        "paths/paths.go",
+        "paths/paths_unix.go",
+        "tsconst/linuxfw.go",
+        "logpolicy/logpolicy.go",
+        "net/dns/resolvconfpath_android.go",
+        "net/dns/resolvconfpath_default.go"
+      ]
+    },
+    {
+      "slug": "tun-netstack-and-netns",
+      "title": "TUN, netstack & netns",
+      "why": "The Android boundary: a pre-opened TUN fd handed in by the module, namespace handling, and the netstack that terminates traffic inside the daemon.",
+      "files": [
+        "cmd/tailscaled/tailscaled.go",
+        "net/tstun/tun.go",
+        "net/netns/netns_android.go",
+        "net/netns/netns_linux.go",
+        "wgengine/netstack/netstack.go",
+        "wgengine/pendopen.go"
+      ]
+    },
+    {
+      "slug": "dns-manager-android",
+      "title": "DNS manager (Android)",
+      "why": "There is no resolv.conf on Android. The manager must set resolver properties directly and must not clobber netd's own view of the network.",
+      "files": [
+        "net/dns/manager_android.go",
+        "net/dns/manager_default.go"
+      ]
+    },
+    {
+      "slug": "routing-and-firewall",
+      "title": "Routing & firewall",
+      "why": "Android's netd owns the policy tables. Route, mark and iptables handling must coexist with netd's rules rather than replace them - the highest-risk area in the series.",
+      "files": [
+        "wgengine/router/osrouter/router_linux.go",
+        "util/linuxfw/iptables.go",
+        "util/linuxfw/iptables_runner.go",
+        "util/linuxfw/linuxfw.go"
+      ]
+    },
+    {
+      "slug": "network-monitor",
+      "title": "Network monitor",
+      "why": "Wi-Fi and cellular handovers must be observed rather than polled blindly; Android's netlink surface differs from desktop Linux.",
+      "files": [
+        "net/netmon/interfaces_android.go",
+        "net/netmon/interfaces_linux.go",
+        "net/netmon/netmon_linux.go",
+        "net/netmon/netmon_polling.go",
+        "net/netmon/state.go"
+      ]
+    },
+    {
+      "slug": "hostinfo-and-os-user",
+      "title": "Hostinfo & OS user",
+      "why": "Platform identity for the coordination server, plus the passwd and group lookups Android simply does not provide.",
+      "files": [
+        "hostinfo/hostinfo_android.go",
+        "util/osuser/group_ids.go",
+        "util/osuser/user.go",
+        "util/osuser/user_android.go"
+      ]
+    },
+    {
+      "slug": "cli-and-feature-knobs",
+      "title": "CLI & feature knobs",
+      "why": "The user-facing switches: tailscale up / set behaviour on a platform with no desktop session, and the env knobs that gate Android-only features.",
+      "files": [
+        "cmd/tailscale/cli/set.go",
+        "cmd/tailscale/cli/up.go",
+        "envknob/featureknob/featureknob.go"
+      ]
+    },
+    {
+      "slug": "daemon-integration",
+      "title": "Daemon integration",
+      "why": "How the local API, the peer API and the cert endpoints behave when the daemon runs as root outside an app sandbox.",
+      "files": [
+        "ipn/ipnlocal/local.go",
+        "ipn/ipnlocal/peerapi.go",
+        "ipn/ipnserver/actor.go",
+        "ipn/localapi/cert.go",
+        "ipn/localapi/disabled_stubs.go"
+      ]
+    },
+    {
+      "slug": "ssh-and-taildrop",
+      "title": "SSH & Taildrop",
+      "why": "The two features the stock Android app never exposed: Tailscale SSH and Taildrop, with Android-safe file operations.",
+      "files": [
+        "feature/ssh/ssh.go",
+        "feature/taildrop/fileops_fs.go",
+        "feature/taildrop/paths.go",
+        "ssh/tailssh/c2n.go",
+        "ssh/tailssh/hostkeys.go",
+        "ssh/tailssh/incubator.go",
+        "ssh/tailssh/incubator_linux.go",
+        "ssh/tailssh/tailssh.go",
+        "ssh/tailssh/user.go"
+      ]
+    },
+    {
+      "slug": "self-update-and-version",
+      "title": "Self-update & version gate",
+      "why": "In-place OTA is impossible for a systemless module, so the self-updater is replaced and the version-format check is neutralised.",
+      "files": [
+        "clientupdate/clientupdate.go",
+        "clientupdate/clientupdate_android.go",
+        "clientupdate/clientupdate_notandroid.go",
+        "version/version_checkformat.go"
+      ]
+    },
+    {
+      "slug": "web-surface",
+      "title": "Web surface",
+      "why": "tsweb adaptations for serving behind the module's local listener.",
+      "files": [
+        "tsweb/tsweb.go"
+      ]
+    }
+  ]
+}

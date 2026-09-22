@@ -1,0 +1,91 @@
+0009 - Daemon integration
+=========================
+
+How the local API, the peer API and the cert endpoints behave when the daemon runs as root outside an app sandbox.
+
+concern   : daemon-integration
+files     : 5
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0009-daemon-integration.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/ipn/ipnlocal/local.go b/ipn/ipnlocal/local.go
+index b5a0a353cd785..8b84d601f8001 100644
+--- a/ipn/ipnlocal/local.go
++++ b/ipn/ipnlocal/local.go
+@@ -7103,7 +7103,14 @@ func exitNodeCanProxyDNS(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg
+ 	}
+ 	for _, p := range peers {
+ 		if p.StableID() == exitNodeID && peerCanProxyDNS(p) {
+-			return peerAPIBase(nm, p) + "/dns-query", true
++			base := peerAPIBase(nm, p)
++			// When peerCanProxyDNS report as true but no peerAPIBase return empty
++			// Example: exit-node peerapi empty because force relogin with different auth url ( need to restart daemon )
++			if base == "" {
++				return "", false
++			}
++			dohURL = base + "/dns-query"
++			return dohURL, true
+ 		}
+ 	}
+ 	return "", false
+diff --git a/ipn/ipnlocal/peerapi.go b/ipn/ipnlocal/peerapi.go
+index d72a519ab1feb..8256a485fe91a 100644
+--- a/ipn/ipnlocal/peerapi.go
++++ b/ipn/ipnlocal/peerapi.go
+@@ -60,9 +60,9 @@ func (s *peerAPIServer) listen(ip netip.Addr, tunIfIndex int) (ln net.Listener,
+ 	// But since we started intercepting it with netstack, it's not even important that
+ 	// we have a real kernel-level listener. So just create a dummy listener on Android
+ 	// and let netstack intercept it.
+-	if runtime.GOOS == "android" {
+-		return newFakePeerAPIListener(ip), nil
+-	}
++	// if runtime.GOOS == "android" {
++	// 	return newFakePeerAPIListener(ip), nil
++	// }
+ 
+ 	ipStr := ip.String()
+ 
+diff --git a/ipn/ipnserver/actor.go b/ipn/ipnserver/actor.go
+index 985a6ef7a712d..7a5c45cd5a4dd 100644
+--- a/ipn/ipnserver/actor.go
++++ b/ipn/ipnserver/actor.go
+@@ -145,7 +145,7 @@ func (a *actor) Username() (string, error) {
+ 		}
+ 		defer tok.Close()
+ 		return tok.Username()
+-	case "darwin", "linux", "illumos", "solaris", "openbsd", "freebsd":
++	case "darwin", "linux", "android", "illumos", "solaris", "openbsd", "freebsd":
+ 		creds := a.ci.Creds()
+ 		if creds == nil {
+ 			return "", errors.New("peer credentials not implemented on this OS")
+diff --git a/ipn/localapi/cert.go b/ipn/localapi/cert.go
+index cd8afa03bf599..01fca8c8152d3 100644
+--- a/ipn/localapi/cert.go
++++ b/ipn/localapi/cert.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !ios && !android && !js && !ts_omit_acme
++//go:build !ios && !js && !ts_omit_acme
+ 
+ package localapi
+ 
+diff --git a/ipn/localapi/disabled_stubs.go b/ipn/localapi/disabled_stubs.go
+index 0d16de880cf41..34d7d1285d56f 100644
+--- a/ipn/localapi/disabled_stubs.go
++++ b/ipn/localapi/disabled_stubs.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build ios || android || js
++//go:build ios || !android || js
+ 
+ package localapi
+ 

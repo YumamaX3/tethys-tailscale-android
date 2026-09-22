@@ -1,0 +1,13 @@
+# Build output: the CI build job writes the patched tree and its binaries here.
+/dist/
+/build/
+*.tgz
+*.upx
+
+# Working copies of the upstream source, if anyone checks one out in-tree.
+/tailscale/
+/tmp/
+
+# Local tool scratch
+/.tmp-*/
+err.tmp

@@ -1,0 +1,248 @@
+0003 - TUN, netstack & netns
+============================
+
+The Android boundary: a pre-opened TUN fd handed in by the module, namespace handling, and the netstack that terminates traffic inside the daemon.
+
+concern   : tun-netstack-and-netns
+files     : 6
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0003-tun-netstack-and-netns.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index fe18731ae09a1..b2a4d8c893489 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -66,9 +66,48 @@ import (
+ 	"tailscale.com/wgengine/router"
+ )
+ 
++// createTailscaleSymlink creates a 'tailscale' symlink pointing to the current
++// 'tailscaled' binary on Android, enabling the combined binary to work with both names.
++func createTailscaleSymlink() {
++	// Get the path to the current executable
++	execPath, err := os.Executable()
++	if err != nil {
++		return // Silently fail, not critical
++	}
++
++	// Resolve symlinks to get the real binary path
++	realPath, err := filepath.EvalSymlinks(execPath)
++	if err != nil {
++		realPath = execPath // Fallback to execPath if symlink resolution fails
++	}
++
++	// Get the binary name and directory
++	binName := filepath.Base(realPath)
++	binDir := filepath.Dir(realPath)
++	symlinkPath := filepath.Join(binDir, "tailscale")
++
++	// Check if 'tailscale' already exists
++	if _, err := os.Lstat(symlinkPath); err == nil {
++		// File exists, check if it's already a symlink to us
++		if target, err := os.Readlink(symlinkPath); err == nil {
++			// It's a symlink, check if it points to our binary
++			if target == binName {
++				return // Already correctly set up
++			}
++		}
++		// Exists but not the right symlink, remove it
++		os.Remove(symlinkPath)
++	}
++
++	// Create the symlink: tailscale -> <actual binary name>
++	_ = os.Symlink(binName, symlinkPath)
++}
++
+ // defaultTunName returns the default tun device name for the platform.
+ func defaultTunName() string {
+ 	switch runtime.GOOS {
++	case "android":
++		return "tailscale0,userspace-networking"
+ 	case "openbsd":
+ 		return "tun"
+ 	case "windows":
+@@ -180,6 +219,12 @@ type proxyStartFunc = func(logf logger.Logf, dialer *tsdial.Dialer)
+ 
+ func main() {
+ 	envknob.PanicIfAnyEnvCheckedInInit()
++
++	// On Android, ensure 'tailscale' symlink exists for combined binary compatibility
++	if runtime.GOOS == "android" {
++		createTailscaleSymlink()
++	}
++
+ 	if shouldRunCLI() {
+ 		beCLI()
+ 		return
+@@ -206,7 +251,7 @@ func main() {
+ 		flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
+ 	}
+ 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
+-	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
++	flag.BoolVar(&args.disableLogs, "no-logs-no-support", true, "disable log uploads; this also disables any technical support")
+ 	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2)")
+ 	if buildfeatures.HasTPM {
+ 		flag.Var(&args.hardwareAttestation, "hardware-attestation", `use hardware-backed keys to bind node identity to this device when supported
+diff --git a/net/tstun/tun.go b/net/tstun/tun.go
+index 42b0d239c39d4..dda5d758fda26 100644
+--- a/net/tstun/tun.go
++++ b/net/tstun/tun.go
+@@ -37,7 +37,7 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
+ 	var dev tun.Device
+ 	var err error
+ 	if strings.HasPrefix(tunName, "tap:") {
+-		if runtime.GOOS != "linux" {
++		if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+ 			return nil, "", errors.New("tap only works on Linux")
+ 		}
+ 		if !CreateTAP.IsSet() { // if the ts_omit_tap tag is used
+diff --git a/net/netns/netns_android.go b/net/netns/netns_android.go
+index 7c5fe3214dcbf..f587ec16e2ba5 100644
+--- a/net/netns/netns_android.go
++++ b/net/netns/netns_android.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build android
++//go:build ignore
+ 
+ package netns
+ 
+diff --git a/net/netns/netns_linux.go b/net/netns/netns_linux.go
+index 02b2dd89b197f..a9a4b77d2866d 100644
+--- a/net/netns/netns_linux.go
++++ b/net/netns/netns_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build linux && !android
++//go:build linux
+ 
+ package netns
+ 
+@@ -111,6 +111,12 @@ func controlC(network, address string, c syscall.RawConn) error {
+ }
+ 
+ func setBypassMark(fd uintptr) error {
++	// Skip when no default route, this will prevent connect: network is unreachable
++	// Example case: force use HTTP_PROXY / HTTPS_PROXY in device without default route / internet route.
++	_, err := netmon.DefaultRouteInterface()
++	if err != nil {
++		return nil
++	}
+ 	if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, tsconst.LinuxBypassMarkNum); err != nil {
+ 		return fmt.Errorf("setting SO_MARK bypass: %w", err)
+ 	}
+diff --git a/wgengine/netstack/netstack.go b/wgengine/netstack/netstack.go
+index 11900edbfa400..4dd9cf546db4d 100644
+--- a/wgengine/netstack/netstack.go
++++ b/wgengine/netstack/netstack.go
+@@ -831,6 +831,64 @@ func (ns *Impl) isLoopbackPort(port uint16) bool {
+ 	return false
+ }
+ 
++// handleDNSResponse intercepts DNS responses from netstack and rewrites the source
++// address back to the original DNS server that the client queried.
++// handleDNSQueryCopy processes a DNS query and sends the response back to the client.
++// This is called in a goroutine to avoid blocking the packet processing path.
++func (ns *Impl) handleDNSQueryCopy(query []byte, src, dst netip.AddrPort, ipVersion uint8, proto ipproto.Proto) {
++	// Query Tailscale DNS with timeout
++	ctx, cancel := context.WithTimeout(ns.ctx, 5*time.Second)
++	defer cancel()
++	
++	protoStr := "udp"
++	if proto == ipproto.TCP {
++		protoStr = "tcp"
++	}
++	
++	resp, err := ns.dns.Query(ctx, query, protoStr, src)
++	if err != nil {
++		if debugPackets {
++			ns.logf("DNS hijack query failed: %v", err)
++		}
++		return
++	}
++
++	// Build response packet using packet.Generate
++	// Response goes FROM queried DNS server TO client
++	var respPacket []byte
++	switch ipVersion {
++	case 4:
++		h := packet.UDP4Header{
++			IP4Header: packet.IP4Header{
++				Src:  dst.Addr(),
++				Dst:  src.Addr(),
++				IPID: 0,
++			},
++			SrcPort: dst.Port(),
++			DstPort: src.Port(),
++		}
++		respPacket = packet.Generate(&h, resp)
++	case 6:
++		h := packet.UDP6Header{
++			IP6Header: packet.IP6Header{
++				Src: dst.Addr(),
++				Dst: src.Addr(),
++			},
++			SrcPort: dst.Port(),
++			DstPort: src.Port(),
++		}
++		respPacket = packet.Generate(&h, resp)
++	default:
++		return
++	}
++
++	// Inject response back to TUN
++	if err := ns.tundev.InjectInboundCopy(respPacket); err != nil && debugPackets {
++		ns.logf("DNS hijack inject failed: %v", err)
++	}
++}
++
++// buildUDPResponse4 builds an IPv4 UDP packet with the given parameters
+ // handleLocalPackets is hooked into the tun datapath for packets leaving
+ // the host and arriving at tailscaled. This method returns filter.DropSilently
+ // to intercept a packet for handling, for instance traffic to quad-100.
+@@ -840,6 +898,24 @@ func (ns *Impl) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper, gro *gro.
+ 		return filter.DropSilently, gro
+ 	}
+ 
++	// Hijack DNS queries to external servers if CorpDNS is enabled
++	if p.Dst.Port() == 53 && (p.IPProto == ipproto.UDP || p.IPProto == ipproto.TCP) {
++		dst := p.Dst.Addr()
++		// Skip hijacking for queries to Tailscale DNS itself
++		if dst != serviceIP && dst != serviceIPv6 {
++			// Only hijack if CorpDNS is enabled (--accept-dns=true)
++			if ns.lb != nil && ns.lb.Prefs().CorpDNS() {
++				// Copy and process DNS query in goroutine
++				if query := p.Payload(); len(query) > 0 {
++					queryCopy := make([]byte, len(query))
++					copy(queryCopy, query)
++					go ns.handleDNSQueryCopy(queryCopy, p.Src, p.Dst, p.IPVersion, p.IPProto)
++				}
++				return filter.DropSilently, gro
++			}
++		}
++	}
++
+ 	// Determine if we care about this local packet.
+ 	dst := p.Dst.Addr()
+ 	serviceName, isVIPServiceIP := ns.atomicIPVIPServiceMap.Load()[dst]
+diff --git a/wgengine/pendopen.go b/wgengine/pendopen.go
+index e816506def871..efb82da1fdbf0 100644
+--- a/wgengine/pendopen.go
++++ b/wgengine/pendopen.go
+@@ -129,6 +129,7 @@ var (
+ // spam like:
+ func (e *userspaceEngine) isOSNetworkProbe(dst netip.AddrPort) bool {
+ 	// iOS had log spam like:
++	// TODO: android also, but IPV6
+ 	// open-conn-track: timeout opening (100.115.73.60:52501 => 17.125.252.5:443); no associated peer node
+ 	if runtime.GOOS == "ios" && dst.Port() == 443 && appleIPRange.Contains(dst.Addr()) {
+ 		if _, ok := e.PeerForIP(dst.Addr()); !ok {

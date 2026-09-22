@@ -1,0 +1,298 @@
+0005 - Routing & firewall
+=========================
+
+Android's netd owns the policy tables. Route, mark and iptables handling must coexist with netd's rules rather than replace them - the highest-risk area in the series.
+
+concern   : routing-and-firewall
+files     : 4
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0005-routing-and-firewall.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/wgengine/router/osrouter/router_linux.go b/wgengine/router/osrouter/router_linux.go
+index 73f65cdf149c1..ee1f743a87b56 100644
+--- a/wgengine/router/osrouter/router_linux.go
++++ b/wgengine/router/osrouter/router_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !android
++//go:build linux
+ 
+ package osrouter
+ 
+@@ -12,6 +12,7 @@ import (
+ 	"net/netip"
+ 	"os"
+ 	"os/exec"
++	"runtime"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -527,8 +528,10 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
+ 	}
+ 
+ 	// Issue 11405: enable IP forwarding on gokrazy.
++
++	// Also enable IP forwarding on Android.
+ 	advertisingRoutes := len(cfg.SubnetRoutes) > 0
+-	if getDistroFunc() == distro.Gokrazy && advertisingRoutes {
++	if (getDistroFunc() == distro.Gokrazy || runtime.GOOS == "android") && advertisingRoutes {
+ 		r.enableIPForwarding()
+ 	}
+ 
+@@ -1398,11 +1401,80 @@ var ubntIPRules = []netlink.Rule{
+ 	},
+ }
+ 
++// detectAndroidDefaultTable returns the routing table number for the current
++// default route on Android. Returns 0 if detection fails.
++func detectAndroidDefaultTable() int {
++	routes, err := netlink.RouteGet(net.IPv4(8, 8, 8, 8))
++	if err != nil || len(routes) == 0 {
++		return 0
++	}
++	if routes[0].Table > 0 {
++		return routes[0].Table
++	}
++	return 0
++}
++
++// getAndroidIPRules returns Android-specific IP rules, including a dynamic
++// exit node rule that uses the current default network's routing table.
++func getAndroidIPRules() []netlink.Rule {
++	rules := []netlink.Rule{
++		// Priority 7300 (12500): Tailscale CGNAT range (100.64.0.0/10) always uses table 52, before VPN rules
++		// This ensures peer-to-peer traffic doesn't go through other VPNs
++		{
++			Priority: 7300, // 5200 + 7300 = 12500
++			Dst:      netipx.PrefixIPNet(netip.MustParsePrefix("100.64.0.0/10")),
++			Table:    tailscaleRouteTable.Num,
++		},
++		{
++			Priority: 7300, // 5200 + 7300 = 12500
++			Dst:      netipx.PrefixIPNet(netip.MustParsePrefix("fd7a:115c:a1e0::/48")),
++			Table:    tailscaleRouteTable.Num,
++		},
++
++		// Priority 13001: lookup main table for reply traffic marked with SubnetRouteMark.
++		// Un-NATed replies to hotspot clients need the downstream subnet route
++		// (e.g. 10.45.158.0/24 dev wlan2) which the kernel adds to the main table.
++		{
++			Priority: 7801,                            // 5200 + 7801 = 13001
++			Mark:     tsconst.LinuxSubnetRouteMarkNum, // 0x8000000
++			Mask:     tsconst.LinuxFwmarkMaskNum,      // 0x1e000000
++			Table:    mainRouteTable.Num,              // 254
++		},
++
++		// Priority 13001: after Android VPN rules at 13000, before default network (14999+)
++		// When VPN active: VPN rules at 13000 catch traffic first (VPN wins)
++		// When VPN off: Tailscale catches traffic as fallback
++		{
++			Priority: 7801, // 5200 + 7801 = 13001
++			Invert:   true,
++			Mark:     tsconst.LinuxBypassMarkNum,
++			Mask:     tsconst.LinuxFwmarkMaskNum,
++			Table:    tailscaleRouteTable.Num,
++		},
++	}
++
++	// Add exit node rule: route traffic FROM Tailscale network to internet
++	// using the current default network's routing table
++	if table := detectAndroidDefaultTable(); table > 0 {
++		// Traffic from tailscale0 is marked with LinuxSubnetRouteMark in ts-forward
++		rules = append(rules, netlink.Rule{
++			Priority: 7801,                            // 5200 + 7801 = 13001
++			Mark:     tsconst.LinuxSubnetRouteMarkNum, // 0x8000000
++			Mask:     tsconst.LinuxFwmarkMaskNum,
++			Table:    table,
++		})
++	}
++
++	return rules
++}
++
+ // ipRules returns the appropriate list of ip rules to be used by Tailscale. See
+ // comments on baseIPRules and ubntIPRules for more details.
+ func ipRules() []netlink.Rule {
+ 	if getDistroFunc() == distro.UBNT {
+ 		return ubntIPRules
++	} else if runtime.GOOS == "android" {
++		return getAndroidIPRules()
+ 	}
+ 	return baseIPRules
+ }
+diff --git a/util/linuxfw/iptables.go b/util/linuxfw/iptables.go
+index 3bd2c288699e4..cd48b39336191 100644
+--- a/util/linuxfw/iptables.go
++++ b/util/linuxfw/iptables.go
+@@ -214,6 +214,9 @@ func clearRules(proto iptables.Protocol, logf logger.Logf) error {
+ 	if err := delTSHook(ipt, "filter", "FORWARD", logf); err != nil {
+ 		errs = append(errs, err)
+ 	}
++	if err := delTSHook(ipt, "mangle", "PREROUTING", logf); err != nil {
++		errs = append(errs, err)
++	}
+ 	if err := delTSHook(ipt, "nat", "POSTROUTING", logf); err != nil {
+ 		errs = append(errs, err)
+ 	}
+@@ -224,6 +227,9 @@ func clearRules(proto iptables.Protocol, logf logger.Logf) error {
+ 	if err := delChain(ipt, "filter", "ts-forward"); err != nil {
+ 		errs = append(errs, err)
+ 	}
++	if err := delChain(ipt, "mangle", "ts-prerouting"); err != nil {
++		errs = append(errs, err)
++	}
+ 
+ 	if err := delChain(ipt, "nat", "ts-postrouting"); err != nil {
+ 		errs = append(errs, err)
+diff --git a/util/linuxfw/iptables_runner.go b/util/linuxfw/iptables_runner.go
+index ace23a2353803..49fb8d00cd91f 100644
+--- a/util/linuxfw/iptables_runner.go
++++ b/util/linuxfw/iptables_runner.go
+@@ -152,6 +152,9 @@ func (i *iptablesRunner) AddHooks() error {
+ 		if err := divert(ipt, "filter", "FORWARD"); err != nil {
+ 			return err
+ 		}
++		if err := divert(ipt, "mangle", "PREROUTING"); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	for _, ipt := range i.getNATTables() {
+@@ -186,6 +189,9 @@ func (i *iptablesRunner) AddChains() error {
+ 		if err := create(ipt, "filter", "ts-forward"); err != nil {
+ 			return err
+ 		}
++		if err := create(ipt, "mangle", "ts-prerouting"); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	for _, ipt := range i.getNATTables() {
+@@ -248,6 +254,30 @@ func (i *iptablesRunner) addBase4(tunname string) error {
+ 		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
+ 	}
+ 
++	// For Android: mark in PREROUTING so routing decision can use the mark
++	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", subnetRouteMark + "/" + fwmarkMask}
++	if err := i.ipt4.Append("mangle", "ts-prerouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v4/mangle/ts-prerouting: %w", args, err)
++	}
++
++	// MASQUERADE exit node traffic going to physical interfaces
++	args = []string{"-i", tunname, "!", "-o", tunname, "-j", "MASQUERADE"}
++	if err := i.ipt4.Append("nat", "ts-postrouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v4/nat/ts-postrouting: %w", args, err)
++	}
++
++	// Allow hotspot clients to access Tailscale network
++	args = []string{"-o", tunname, "-j", "MASQUERADE"}
++	if err := i.ipt4.Append("nat", "ts-postrouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v4/nat/ts-postrouting: %w", args, err)
++	}
++
++	// Clamp MSS for forwarded TCP to avoid TLS failures with double-VPN/low MTU tunnels
++	args = []string{"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"}
++	if err := i.ipt4.Append("mangle", "ts-prerouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v4/mangle/ts-prerouting: %w", args, err)
++	}
++
+ 	return nil
+ }
+ 
+@@ -352,6 +382,34 @@ func (i *iptablesRunner) addBase6(tunname string) error {
+ 		return fmt.Errorf("adding %v in v6/filter/ts-forward: %w", args, err)
+ 	}
+ 
++	// Mark packets from subnetRouter, need enable IP6 NAT zcat /proc/config.gz | grep IP6_NF_NAT 2>/dev/null
++	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", subnetRouteMark + "/" + fwmarkMask}
++	if err := i.ipt6.Append("mangle", "ts-prerouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v6/mangle/ts-prerouting: %w", args, err)
++	}
++
++	// MASQUERADE exit node traffic going to physical interfaces
++	if i.v6NATAvailable {
++		args = []string{"-i", tunname, "!", "-o", tunname, "-j", "MASQUERADE"}
++		if err := i.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
++			return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
++		}
++	}
++
++	// Allow hotspot clients to access Tailscale network
++	if i.v6NATAvailable {
++		args = []string{"-o", tunname, "-j", "MASQUERADE"}
++		if err := i.ipt6.Append("nat", "ts-postrouting", args...); err != nil {
++			return fmt.Errorf("adding %v in v6/nat/ts-postrouting: %w", args, err)
++		}
++	}
++
++	// Clamp MSS for forwarded TCP to avoid TLS failures with double-VPN/low MTU tunnels
++	args = []string{"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"}
++	if err := i.ipt6.Append("mangle", "ts-prerouting", args...); err != nil {
++		return fmt.Errorf("adding %v in v6/mangle/ts-prerouting: %w", args, err)
++	}
++
+ 	return nil
+ }
+ 
+@@ -364,6 +422,9 @@ func (i *iptablesRunner) DelChains() error {
+ 		if err := delChain(ipt, "filter", "ts-forward"); err != nil {
+ 			return err
+ 		}
++		if err := delChain(ipt, "mangle", "ts-prerouting"); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	for _, ipt := range i.getNATTables() {
+@@ -397,6 +458,9 @@ func (i *iptablesRunner) DelBase() error {
+ 		if err := del(ipt, "filter", "ts-forward"); err != nil {
+ 			return err
+ 		}
++		if err := del(ipt, "mangle", "ts-prerouting"); err != nil {
++			return err
++		}
+ 	}
+ 	for _, ipt := range i.getNATTables() {
+ 		if err := del(ipt, "nat", "ts-postrouting"); err != nil {
+@@ -417,6 +481,9 @@ func (i *iptablesRunner) DelHooks(logf logger.Logf) error {
+ 		if err := delTSHook(ipt, "filter", "FORWARD", logf); err != nil {
+ 			return err
+ 		}
++		if err := delTSHook(ipt, "mangle", "PREROUTING", logf); err != nil {
++			return err
++		}
+ 	}
+ 	for _, ipt := range i.getNATTables() {
+ 		if err := delTSHook(ipt, "nat", "POSTROUTING", logf); err != nil {
+diff --git a/util/linuxfw/linuxfw.go b/util/linuxfw/linuxfw.go
+index ed130a2b1416b..d7fa94bd7dfc6 100644
+--- a/util/linuxfw/linuxfw.go
++++ b/util/linuxfw/linuxfw.go
+@@ -88,17 +88,17 @@ const (
+ 
+ // getTailscaleFwmarkMaskNeg returns the negation of TailscaleFwmarkMask in bytes.
+ func getTailscaleFwmarkMaskNeg() []byte {
+-	return []byte{0xff, 0x00, 0xff, 0xff}
++	return []byte{0xe1, 0xff, 0xff, 0xff}
+ }
+ 
+ // getTailscaleFwmarkMask returns the TailscaleFwmarkMask in bytes.
+ func getTailscaleFwmarkMask() []byte {
+-	return []byte{0x00, 0xff, 0x00, 0x00}
++	return []byte{0x1e, 0x00, 0x00, 0x00}
+ }
+ 
+ // getTailscaleSubnetRouteMark returns the TailscaleSubnetRouteMark in bytes.
+ func getTailscaleSubnetRouteMark() []byte {
+-	return []byte{0x00, 0x04, 0x00, 0x00}
++	return []byte{0x08, 0x00, 0x00, 0x00}
+ }
+ 
+ // checkIPv6ForTest can be set in tests.

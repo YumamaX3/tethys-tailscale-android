@@ -1,0 +1,238 @@
+0007 - Hostinfo & OS user
+=========================
+
+Platform identity for the coordination server, plus the passwd and group lookups Android simply does not provide.
+
+concern   : hostinfo-and-os-user
+files     : 4
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0007-hostinfo-and-os-user.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/hostinfo/hostinfo_android.go b/hostinfo/hostinfo_android.go
+new file mode 100644
+index 0000000000000..b3ed917ec54d2
+--- /dev/null
++++ b/hostinfo/hostinfo_android.go
+@@ -0,0 +1,79 @@
++//go:build android
++
++package hostinfo
++
++import (
++	"os/exec"
++	"strings"
++
++	"tailscale.com/tailcfg"
++)
++
++func init() {
++	RegisterHostinfoNewHook(func(hi *tailcfg.Hostinfo) {
++		// Replace generic "node" or "localhost" with meaningful Android hostname
++		if hi.Hostname == "node" || hi.Hostname == "localhost" {
++			hi.Hostname = sanitizeHostname(
++				getSystemProperty("ro.product.manufacturer") + "-" +
++					getSystemProperty("ro.product.model"),
++			)
++			if hi.Hostname == "" {
++				hi.Hostname = "android"
++			}
++		}
++
++		// Set OSVersion if not already set
++		if hi.OSVersion == "" {
++			hi.OSVersion = getSystemProperty("ro.build.version.release")
++		}
++
++		// Ensure Device Model is populated
++		if hi.DeviceModel == "" {
++			hi.DeviceModel = getSystemProperty("ro.product.model")
++		}
++	})
++}
++
++// getSystemProperty reads Android system properties via getprop command
++func getSystemProperty(prop string) string {
++	out, err := exec.Command("getprop", prop).Output()
++	if err != nil {
++		return ""
++	}
++	return strings.TrimSpace(string(out))
++}
++
++// sanitizeHostname removes invalid characters from a hostname.
++// Valid hostnames contain only alphanumerics and hyphens.
++func sanitizeHostname(s string) string {
++	s = strings.ToLower(s)
++	var result strings.Builder
++
++	for _, ch := range s {
++		switch {
++		case (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'):
++			result.WriteRune(ch)
++		case ch == '-' || ch == '_' || ch == ' ':
++			// Convert spaces and underscores to hyphens
++			if result.Len() > 0 && result.String()[result.Len()-1] != '-' {
++				result.WriteRune('-')
++			}
++		}
++	}
++
++	hostname := result.String()
++	// Remove leading/trailing hyphens
++	hostname = strings.Trim(hostname, "-")
++	// Collapse multiple hyphens
++	for strings.Contains(hostname, "--") {
++		hostname = strings.ReplaceAll(hostname, "--", "-")
++	}
++
++	// Limit to 63 characters (max label length in hostname)
++	if len(hostname) > 63 {
++		hostname = hostname[:63]
++		hostname = strings.TrimRight(hostname, "-")
++	}
++
++	return hostname
++}
+diff --git a/util/osuser/group_ids.go b/util/osuser/group_ids.go
+index 34d15c926ae98..f59faa704990b 100644
+--- a/util/osuser/group_ids.go
++++ b/util/osuser/group_ids.go
+@@ -19,6 +19,18 @@ import (
+ // an error. It will first try to use the 'id' command to get the group IDs,
+ // and if that fails, it will fall back to the user.GroupIds method.
+ func GetGroupIds(user *user.User) ([]string, error) {
++	if runtime.GOOS == "android" {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		if out, err := exec.CommandContext(ctx, "id", "-Gz").Output(); err == nil {
++			if len(out) > 0 {
++				return parseGroupIds(out), nil
++			}
++		}
++
++		return []string{"0"}, nil
++	}
++	
+ 	if runtime.GOOS == "plan9" {
+ 		return nil, nil
+ 	}
+diff --git a/util/osuser/user.go b/util/osuser/user.go
+index 2de3da762739d..20ec32ce9ebe1 100644
+--- a/util/osuser/user.go
++++ b/util/osuser/user.go
+@@ -19,6 +19,9 @@ import (
+ 	"tailscale.com/version/distro"
+ )
+ 
++// overrideLookupFunc is set by custom platform-specific implementations.
++var overrideLookupFunc func(string, bool) (*user.User, string, error)
++
+ // LookupByUIDWithShell is like os/user.LookupId but handles a few edge cases
+ // like gokrazy and non-cgo lookups, and returns the user shell. The user shell
+ // lookup is best-effort and may be empty.
+@@ -68,6 +71,11 @@ func lookup(usernameOrUID string, std lookupStd, wantShell bool) (*user.User, st
+ 		return u, shell, err
+ 	}
+ 
++	// Android-specific lookup
++	if runtime.GOOS == "android" && overrideLookupFunc != nil {
++		return overrideLookupFunc(usernameOrUID, wantShell)
++	}
++
+ 	// No getent on Gokrazy. So hard-code the login shell.
+ 	if distro.Get() == distro.Gokrazy {
+ 		var shell string
+diff --git a/util/osuser/user_android.go b/util/osuser/user_android.go
+new file mode 100644
+index 0000000000000..6fbc91d0c60d0
+--- /dev/null
++++ b/util/osuser/user_android.go
+@@ -0,0 +1,83 @@
++//go:build android
++
++package osuser
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"os/user"
++	"strings"
++	"time"
++)
++
++func init() {
++	overrideLookupFunc = androidLookup
++}
++
++// androidLookup handles user lookup on Android systems.
++// On Android, there's no getent command, so we use shell commands (id, etc).
++// androidLookup implements user lookup for Android systems
++func androidLookup(usernameOrUID string, wantShell bool) (*user.User, string, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	var shell string
++	if wantShell {
++		if out, err := exec.LookPath("bash"); err == nil {
++			shell = out
++		} else if out, err := exec.LookPath("sh"); err == nil {
++			shell = out
++		} else {
++			shell = "/system/bin/sh"
++		}
++	}
++
++	// Try to get info for requested user first
++	uid := getAndroidCommandOutput(ctx, "id", "-u", usernameOrUID, "")
++	if uid == "" {
++		// User doesn't exist, fallback to current user
++		uid = getAndroidCommandOutput(ctx, "id", "-u", "0")
++		usernameOrUID = "root"
++	}
++
++	gid := getAndroidCommandOutput(ctx, "id", "-g", usernameOrUID, "0")
++	username := getAndroidCommandOutput(ctx, "id", "-un", usernameOrUID, usernameOrUID)
++	homeDir := getAndroidHomeDir("/")
++
++	return &user.User{
++		Uid:      uid,
++		Gid:      gid,
++		Username: username,
++		Name:     "Android",
++		HomeDir:  homeDir,
++	}, shell, nil
++}
++
++// getAndroidCommandOutput executes a command and returns trimmed output,
++// or returns the default value (last arg) if the command fails.
++func getAndroidCommandOutput(ctx context.Context, cmd string, args ...string) string {
++	if len(args) == 0 {
++		return ""
++	}
++
++	// Last argument is the default value
++	defaultValue := args[len(args)-1]
++	cmdArgs := args[:len(args)-1]
++
++	out, err := exec.CommandContext(ctx, cmd, cmdArgs...).Output()
++	if err != nil {
++		return defaultValue
++	}
++
++	return strings.TrimSpace(string(out))
++}
++
++// getAndroidHomeDir returns the home directory on Android.
++// Falls back to defaultDir if unable to determine.
++func getAndroidHomeDir(defaultDir string) string {
++	if home, err := os.UserHomeDir(); err == nil {
++		return strings.TrimSpace(home)
++	}
++	return defaultDir
++}

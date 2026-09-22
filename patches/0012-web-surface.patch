@@ -1,0 +1,36 @@
+0012 - Web surface
+==================
+
+tsweb adaptations for serving behind the module's local listener.
+
+concern   : web-surface
+files     : 1
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0012-web-surface.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/tsweb/tsweb.go b/tsweb/tsweb.go
+index 101512b89b7f8..e275062251581 100644
+--- a/tsweb/tsweb.go
++++ b/tsweb/tsweb.go
+@@ -42,6 +42,16 @@ import (
+ var DevMode bool
+ 
+ func DefaultCertDir(leafDir string) string {
++	if runtime.GOOS == "android" {
++		if fi, err := os.Stat("/data/adb/tailscale"); err == nil && fi.IsDir() {
++			return "/data/adb/tailscale/certs"
++		}
++		prefix := os.Getenv("PREFIX")
++		if prefix == "" {
++			return filepath.Join(os.TempDir(), "tailscale", "certs")
++		}
++		return filepath.Join(prefix, "var", "lib", "tailscale", "certs")
++	}
+ 	cacheDir, err := os.UserCacheDir()
+ 	if err == nil {
+ 		return filepath.Join(cacheDir, "tailscale", leafDir)

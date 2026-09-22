@@ -1,0 +1,182 @@
+0002 - Paths & runtime locations
+================================
+
+Android has no /var/lib and no writable /etc: daemon state must live under /data/adb. Establishes where the daemon reads and writes before anything else moves.
+
+concern   : paths-and-runtime-locations
+files     : 6
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0002-paths-and-runtime-locations.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/paths/paths.go b/paths/paths.go
+index 398d8b23d8988..e5b8750ccc8e4 100644
+--- a/paths/paths.go
++++ b/paths/paths.go
+@@ -22,6 +22,16 @@ var AppSharedDir syncs.AtomicValue[string]
+ // DefaultTailscaledSocket returns the path to the tailscaled Unix socket
+ // or the empty string if there's no reasonable default.
+ func DefaultTailscaledSocket() string {
++	if runtime.GOOS == "android" {
++		if fi, err := os.Stat("/data/adb/tailscale"); err == nil && fi.IsDir() {
++			return "/data/adb/tailscale/tailscaled.sock"
++		}
++		prefix := os.Getenv("PREFIX")
++		if prefix == "" {
++			return filepath.Join(os.TempDir(), "tailscale", "tailscaled.sock")
++		}
++		return filepath.Join(prefix, "var", "run", "tailscaled.sock")
++	}
+ 	if runtime.GOOS == "windows" {
+ 		return `\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled`
+ 	}
+@@ -92,7 +102,7 @@ func DefaultTailscaledStateDir() string {
+ // when it's absent.
+ func MakeAutomaticStateDir() bool {
+ 	switch runtime.GOOS {
+-	case "plan9":
++	case "plan9", "android":
+ 		return true
+ 	case "linux":
+ 		if distro.Get() == distro.JetKVM {
+diff --git a/paths/paths_unix.go b/paths/paths_unix.go
+index b1556b233104f..2291247803af7 100644
+--- a/paths/paths_unix.go
++++ b/paths/paths_unix.go
+@@ -33,6 +33,15 @@ func statePath() string {
+ 		return "/Library/Tailscale/tailscaled.state"
+ 	case "aix":
+ 		return "/var/tailscale/tailscaled.state"
++	case "android":
++		if fi, err := os.Stat("/data/adb/tailscale"); err == nil && fi.IsDir() {
++			return "/data/adb/tailscale/tailscaled.state"
++		}
++		prefix := os.Getenv("PREFIX")
++		if prefix == "" {
++			return filepath.Join(os.TempDir(), "tailscale", "tailscaled.state")
++		}
++		return filepath.Join(prefix, "var", "lib", "tailscale", "tailscaled.state")
+ 	default:
+ 		return ""
+ 	}
+diff --git a/tsconst/linuxfw.go b/tsconst/linuxfw.go
+index 3a7a4cf2e0b5e..7e29ea55fd6d6 100644
+--- a/tsconst/linuxfw.go
++++ b/tsconst/linuxfw.go
+@@ -13,31 +13,31 @@ package tsconst
+ // that sysadmins would use those. Kubernetes uses a few bits in the
+ // second byte, so we steer clear of that too.
+ //
+-// Empirically, most of the documentation on packet marks on the
+-// internet gives the impression that the marks are 16 bits
+-// wide. Based on this, we theorize that the upper two bytes are
+-// relatively unused in the wild, and so we consume bits 16:23 (the
+-// third byte).
++// Ref: https://www.kxxt.dev/blog/full-tailscale-on-android-and-remote-unlocking/
++// AOSP's code for Fwmark allocation is
++// https://android.googlesource.com/platform/system/netd/+/master/include/Fwmark.h
++//
++// The lower 0-20 bits are already allocated by Android.
++// Bit 21-28 is currently unused.
++// Tailscale uses bits 25-28 and also sets bit 17 (ProtectedFromVPN).
+ //
+ // The constants are in the iptables/iproute2 string format for
+ // matching and setting the bits, so they can be directly embedded in
+ // commands.
+ const (
+ 	// The mask for reading/writing the 'firewall mask' bits on a packet.
+-	// See the comment on the const block on why we only use the third byte.
+-	//
+-	// We claim bits 16:23 entirely. For now we only use the lower four
+-	// bits, leaving the higher 4 bits for future use.
+-	LinuxFwmarkMask    = "0xff0000"
+-	LinuxFwmarkMaskNum = 0xff0000
++	// We claim bits 25:28 entirely.
++	LinuxFwmarkMask    = "0x1e000000"
++	LinuxFwmarkMaskNum = 0x1e000000
+ 
+ 	// Packet is from Tailscale and to a subnet route destination, so
+ 	// is allowed to be routed through this machine.
+-	LinuxSubnetRouteMark    = "0x40000"
+-	LinuxSubnetRouteMarkNum = 0x40000
++	LinuxSubnetRouteMark    = "0x8000000"
++	LinuxSubnetRouteMarkNum = 0x8000000
+ 
+ 	// Packet was originated by tailscaled itself, and must not be
+ 	// routed over the Tailscale network.
+-	LinuxBypassMark    = "0x80000"
+-	LinuxBypassMarkNum = 0x80000
++	// Includes bit 17 (0x20000) ProtectedFromVPN to bypass Android VPN routing.
++	LinuxBypassMark    = "0x10020000"
++	LinuxBypassMarkNum = 0x10020000
+ )
+diff --git a/logpolicy/logpolicy.go b/logpolicy/logpolicy.go
+index 7a0027dad74ea..e0cfe74073d82 100644
+--- a/logpolicy/logpolicy.go
++++ b/logpolicy/logpolicy.go
+@@ -252,6 +252,17 @@ func LogsDir(logf logger.Logf) string {
+ 		}
+ 	}
+ 
++	if runtime.GOOS == "android" {
++		if fi, err := os.Stat("/data/adb/tailscale"); err == nil && fi.IsDir() {
++			return "/data/adb/tailscale/log"
++		}
++		prefix := os.Getenv("PREFIX")
++		if prefix == "" {
++			return filepath.Join(os.TempDir(), "tailscale", "log")
++		}
++		return filepath.Join(prefix, "var", "log", "tailscale")
++	}
++
+ 	cacheDir, err := os.UserCacheDir()
+ 	if err == nil {
+ 		d := filepath.Join(cacheDir, "Tailscale")
+diff --git a/net/dns/resolvconfpath_android.go b/net/dns/resolvconfpath_android.go
+new file mode 100644
+index 0000000000000..5c5ffa04f48a8
+--- /dev/null
++++ b/net/dns/resolvconfpath_android.go
+@@ -0,0 +1,25 @@
++//go:build android
++
++package dns
++
++import (
++	"os"
++	"path/filepath"
++)
++
++var (
++	resolvConf string
++	backupConf string
++)
++
++func init() {
++	prefix := os.Getenv("PREFIX")
++	if fi, err := os.Stat("/data/adb/tailscale"); err == nil && fi.IsDir() {
++		prefix = "/data/adb/tailscale"
++	} else if prefix == "" {
++		prefix = filepath.Join(os.TempDir(), "tailscale")
++	}
++	dnsDir := filepath.Join(prefix, "etc")
++	resolvConf = filepath.Join(dnsDir, "resolv.conf")
++	backupConf = filepath.Join(dnsDir, "resolv.pre-tailscale-backup.conf")
++}
+diff --git a/net/dns/resolvconfpath_default.go b/net/dns/resolvconfpath_default.go
+index 00caf30b24a64..a62dcd4b950b8 100644
+--- a/net/dns/resolvconfpath_default.go
++++ b/net/dns/resolvconfpath_default.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !gokrazy
++//go:build !gokrazy && !android
+ 
+ package dns
+ 

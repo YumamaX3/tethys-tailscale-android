@@ -1,0 +1,118 @@
+0006 - Network monitor
+======================
+
+Wi-Fi and cellular handovers must be observed rather than polled blindly; Android's netlink surface differs from desktop Linux.
+
+concern   : network-monitor
+files     : 5
+upstream  : squashed android patch d6a7411 (tailscale v1.98.5 -> v1.98.8), 2026-07-13
+apply     : git apply patches/0006-network-monitor.patch
+
+Regrouped by concern from the upstream squashed patch - the ten commits named in
+that squash are not recoverable from it, so this is a reviewed regrouping, not a
+recovery. The split is lossless and machine-checked; see patches/MANIFEST.md.
+Everything above the first "diff --git" is a preamble and is ignored by git apply.
+
+diff --git a/net/netmon/interfaces_android.go b/net/netmon/interfaces_android.go
+index 2cd7f23f6f164..efbd3391d7a1d 100644
+--- a/net/netmon/interfaces_android.go
++++ b/net/netmon/interfaces_android.go
+@@ -1,6 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
++//go:build ignore
+ package netmon
+ 
+ import (
+diff --git a/net/netmon/interfaces_linux.go b/net/netmon/interfaces_linux.go
+index 64cb0b9af2ce6..cf9a9f6f4ba42 100644
+--- a/net/netmon/interfaces_linux.go
++++ b/net/netmon/interfaces_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !android
++//go:build linux
+ 
+ package netmon
+ 
+diff --git a/net/netmon/netmon_linux.go b/net/netmon/netmon_linux.go
+index b7d87f995634f..591a4126debf9 100644
+--- a/net/netmon/netmon_linux.go
++++ b/net/netmon/netmon_linux.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build !android
++//go:build linux
+ 
+ package netmon
+ 
+diff --git a/net/netmon/netmon_polling.go b/net/netmon/netmon_polling.go
+index bdeb43005782b..dcef542755a6f 100644
+--- a/net/netmon/netmon_polling.go
++++ b/net/netmon/netmon_polling.go
+@@ -1,7 +1,7 @@
+ // Copyright (c) Tailscale Inc & contributors
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+-//go:build (!linux && !freebsd && !windows && !darwin) || android
++//go:build (!linux && !freebsd && !windows && !darwin) 
+ 
+ package netmon
+ 
+diff --git a/net/netmon/state.go b/net/netmon/state.go
+index 94554dcc39c1e..21717d345ced3 100644
+--- a/net/netmon/state.go
++++ b/net/netmon/state.go
+@@ -14,6 +14,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 
++	"github.com/wlynxg/anet"
+ 	"tailscale.com/envknob"
+ 	"tailscale.com/feature"
+ 	"tailscale.com/feature/buildfeatures"
+@@ -175,6 +176,10 @@ func (i Interface) Addrs() ([]net.Addr, error) {
+ 	if i.Interface == nil {
+ 		return nil, nil
+ 	}
++	// use the netmon package to get the addresses
++	if runtime.GOOS == "android" {
++		return anet.InterfaceAddrsByInterface(i.Interface)
++	}
+ 
+ 	return i.Interface.Addrs()
+ }
+@@ -535,6 +540,9 @@ func (s *State) AnyInterfaceUp() bool {
+ 	if runtime.GOOS == "js" || runtime.GOOS == "tamago" {
+ 		return true
+ 	}
++	if envknob.Bool("TS_ASSUME_NETWORK_UP_FOR_TEST") {
++		return true
++	}
+ 	return s != nil && (s.HaveV4 || s.HaveV6)
+ }
+ 
+@@ -843,6 +851,18 @@ func netInterfaces() ([]Interface, error) {
+ 	if altNetInterfaces != nil {
+ 		return altNetInterfaces()
+ 	}
++	// Use the netmon package to get the addresses
++	if runtime.GOOS == "android" {
++		ifs, err := anet.Interfaces()
++		if err != nil {
++			return nil, err
++		}
++		ret := make([]Interface, len(ifs))
++		for i := range ifs {
++			ret[i].Interface = &ifs[i]
++		}
++		return ret, nil
++	}
+ 	ifs, err := net.Interfaces()
+ 	if err != nil {
+ 		return nil, err
