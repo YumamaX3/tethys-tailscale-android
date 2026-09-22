@@ -1,0 +1,187 @@
+name: build-android
+
+# Milestone M2 — the build & release current.
+#
+# The daemon the module runs does not exist in either repository as a committed
+# file: it is produced HERE, by checking out the pinned Tailscale tag, applying
+# this fork's patch series, and building the android target. That is the whole
+# point of owning a patch fork (plan decision D1) — every defect the plan cares
+# about lives inside the Go binary, and a binary someone else built cannot be
+# repaired from outside it.
+#
+# The build is driven by ./scripts/android.sh, which patch 0001 CREATES. Its
+# behaviour is read from that patch, not guessed:
+#
+#   build [--pre] [--upx] [--nocgo] <arm|arm64|amd64>
+#     - ARM64 : GOARCH=arm64, CC=aarch64-linux-android21-clang
+#     - NDK   : r27c; setup_ndk() provisions it when ANDROID_NDK_PATH is unset,
+#               so this workflow does NOT need a separate NDK action
+#     - CGO_ENABLED=1 by default (the NDK is required); --nocgo drops it
+#     - output: dist/tailscaled.<arch>
+#   check  : go vet + a build of both binaries, android/<arch>
+#
+# UPX is deliberately NOT used. Plan R34 names it, and the plan's own risk
+# register returns the answer: "UPX-packed binary trips AV / Play Protect — ...
+# the CI also emits an uncompressed build." The artifact travels inside a module
+# zip, so the download is already compressed; the packing would buy little and
+# risk the binary being quarantined on the very device it targets. The
+# uncompressed build IS the released artifact.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Build as a pre-release (appends -pre to the version stamp)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  TAILSCALE_TAG: v1.98.8
+
+jobs:
+  build:
+    name: android/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Pixel 6 Pro is arm64-v8a, so arm64 is what the module consumes.
+        # arm is built because the plan's M2 proof names both, and because it
+        # keeps this series honest for other devices without re-running CI later.
+        arch: [arm64, arm]
+    steps:
+      - name: Checkout the fork (patch series + splitter)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Checkout Tailscale at the pinned tag
+        uses: actions/checkout@v4
+        with:
+          repository: tailscale/tailscale
+          ref: ${{ env.TAILSCALE_TAG }}
+          path: tailscale
+          fetch-depth: 1
+
+      - name: Verify the series applies cleanly, nothing applied
+        working-directory: tailscale
+        run: |
+          set -euo pipefail
+          n=0
+          for p in ../fork/patches/0*.patch; do
+            git apply --check "$p" || { echo "FAIL: $(basename "$p") does not apply" >&2; exit 1; }
+            n=$((n + 1))
+          done
+          echo "all $n patches apply cleanly onto $TAILSCALE_TAG"
+
+      - name: Apply the patch series
+        working-directory: tailscale
+        run: |
+          set -euo pipefail
+          for p in ../fork/patches/0*.patch; do
+            echo "applying $(basename "$p")"
+            git apply "$p"
+          done
+          # scripts/android.sh is created by patch 0001 - if it is missing, the
+          # series did not apply and every step below would be meaningless.
+          test -x ./scripts/android.sh || { echo "FAIL: scripts/android.sh absent after patching" >&2; exit 1; }
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tailscale/go.mod
+          cache-dependency-path: tailscale/go.sum
+
+      - name: Build android/${{ matrix.arch }}
+        working-directory: tailscale
+        run: |
+          set -euo pipefail
+          # android.sh provisions NDK r27c itself when ANDROID_NDK_PATH is unset.
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            ./scripts/android.sh build --pre "${{ matrix.arch }}"
+          else
+            ./scripts/android.sh build "${{ matrix.arch }}"
+          fi
+
+      - name: Vet and build both binaries for android/${{ matrix.arch }}
+        working-directory: tailscale
+        run: ./scripts/android.sh check "${{ matrix.arch }}"
+
+      - name: Probe the binary (do not ship one that cannot report itself)
+        working-directory: tailscale
+        run: |
+          set -euo pipefail
+          BIN="dist/tailscaled.${{ matrix.arch }}"
+          test -s "$BIN" || { echo "FAIL: $BIN missing or empty" >&2; exit 1; }
+          file "$BIN"
+          ls -l "$BIN"
+          ./build_dist.sh shellvars > /tmp/shellvars.txt || true
+          cat /tmp/shellvars.txt || true
+
+      - name: Checksum the artifact
+        working-directory: tailscale
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum "tailscaled.${{ matrix.arch }}" > "tailscaled.${{ matrix.arch }}.sha256"
+          cat "tailscaled.${{ matrix.arch }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscaled-${{ matrix.arch }}
+          path: |
+            tailscale/dist/tailscaled.${{ matrix.arch }}
+            tailscale/dist/tailscaled.${{ matrix.arch }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the fork
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Collect every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Build the SHA256 manifest
+        run: |
+          set -euo pipefail
+          cd out
+          ls -l
+          # One manifest covering every artifact, so a downloader verifies with
+          # a single command rather than per-file guesswork.
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          echo "--- manifest ---"
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The Description Decree: a release carries the story, not a bare
+          # "Release vX". The body is assembled from the tag and the manifest.
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "tethys-tailscale-android ${GITHUB_REF_NAME}" \
+            --notes-file fork/docs/PROVENANCE.md \
+            out/tailscaled.arm64 out/tailscaled.arm out/SHA256SUMS || \
+          gh release upload "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            out/tailscaled.arm64 out/tailscaled.arm out/SHA256SUMS --clobber
