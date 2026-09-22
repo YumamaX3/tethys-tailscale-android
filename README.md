@@ -77,9 +77,25 @@ Then build for the target device. `scripts/android.sh` is created by patch 0001:
 ./scripts/android.sh build --nocgo arm64    # CGO off — no NDK required
 ```
 
-The Pixel 6 Pro is `arm64-v8a`, so only the `arm64` target is built. Upstream's
-own workflow builds `arm` as well; that half is deliberately dropped here for
-this device.
+Both targets are built, and the release carries both: `tailscaled.arm64` **and**
+`tailscaled.arm`. The *module* that consumes this series ships the arm64 payload
+alone, because a Pixel 6 Pro cannot execute a 32-bit one — but the release is not
+the module, and a 32-bit device can use it (plan §17 M2: *arm64 + arm artifacts*).
+
+`check`, however, runs on the **arm64 leg only**. Its usage block documents it as
+`check [arm64]`, and it pins `CGO_ENABLED=0` — which is impossible for the 32-bit
+target by a *platform* rule rather than a cgo package: Go's `internal/platform`
+returns true from `MustLinkExternal` for `android/arm` with or without cgo, so the
+toolchain refuses before it analyses anything:
+
+```
+android/arm requires external (cgo) linking, but cgo is not enabled
+```
+
+The 32-bit leg's proof is therefore its **build**, which compiles the shipped
+artifact with the release recipe itself (`CGO_ENABLED=1` + NDK r27c). What that leg
+does not get is vet plus a compile-check of the CLI — and this release ships no CLI.
+Named here rather than left to be discovered.
 
 ## Regenerating the series
 

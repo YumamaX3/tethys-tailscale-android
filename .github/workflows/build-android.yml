@@ -153,9 +153,29 @@ jobs:
             ./scripts/android.sh build "${{ matrix.arch }}"
           fi
 
-      - name: Vet and build both binaries for android/${{ matrix.arch }}
+      - name: Vet android/${{ matrix.arch }} (check is arm64-only by contract)
         working-directory: tailscale
-        run: ./scripts/android.sh check "${{ matrix.arch }}"
+        run: |
+          set -euo pipefail
+          # android.sh's own usage block documents this verb as `check [arm64]`,
+          # and the reason is a platform rule rather than a package: Go's
+          # internal/platform.MustLinkExternal returns true for android/arm with
+          # or without cgo, so with the verb's pinned CGO_ENABLED=0 the go command
+          # refuses outright before it analyses anything -
+          #   android/arm requires external (cgo) linking, but cgo is not enabled
+          # That refusal is what failed the first tag run (v1.98.8-tethys.0) - and
+          # it was the only failure: the arm artifact had already been built by
+          # the step above.
+          #
+          # So this leg's proof is its build, which compiles the SHIPPED artifact
+          # with the release recipe itself (CGO_ENABLED=1 + NDK r27c). What it does
+          # not get is vet plus a compile-check of the CLI - and this release ships
+          # no CLI. Named here rather than left to be discovered.
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            ./scripts/android.sh check arm64
+          else
+            echo "arm: android/arm has no internal-link path, so check (CGO_ENABLED=0) cannot vet it - the cgo build above is this leg's proof"
+          fi
 
       - name: Probe the binary (do not ship one that cannot report itself)
         working-directory: tailscale
