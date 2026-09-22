@@ -92,6 +92,50 @@ jobs:
           # series did not apply and every step below would be meaningless.
           test -x ./scripts/android.sh || { echo "FAIL: scripts/android.sh absent after patching" >&2; exit 1; }
 
+      - name: Wire every device profile that builds this arch
+        working-directory: fork
+        run: |
+          set -euo pipefail
+          # The profiles are the build's own configuration, so they are verified
+          # BEFORE they are trusted. A profile naming the wrong NDK, or an ABI its
+          # own GOARCH cannot produce, is worse than no profile at all: it would
+          # be a document of intent wearing a configuration's authority. The
+          # verifier re-derives each claim from the build itself - the NDK from
+          # patch 0001, CGO and the arch matrix from this workflow - and fails
+          # loudly the day any of them drifts.
+          sh tools/check-device-profile.sh
+
+          for p in devices/*.env; do
+            # Read each profile in a subshell: nothing it sets may reach this
+            # shell until we have decided that it describes THIS leg.
+            arch=$( ( set -eu; set -a; . "$p"; printf '%s' "${TETHYS_GOARCH-}" ) )
+            if [ "$arch" != "${{ matrix.arch }}" ]; then
+              echo "$p: builds $arch, not ${{ matrix.arch }} - skipped"
+              continue
+            fi
+
+            # GOARM64 reaches the toolchain by INHERITANCE - android.sh never
+            # names it, it only inherits it - so the export must land in the
+            # environment the build actually runs in. The value shipped is the
+            # profile's conservative default: Go's arm64 baseline is v8.0, and
+            # raising the level past what the silicon satisfies is an illegal
+            # instruction at runtime, never a build error. Raise it in the
+            # profile only after measuring on the device.
+            goarm64=$( ( set -eu; set -a; . "$p"; printf '%s' "${TETHYS_GOARM64-}" ) )
+            test -n "$goarm64" || { echo "FAIL: $p declares no TETHYS_GOARM64" >&2; exit 1; }
+
+            # Two profiles claiming one arch with different levels would be
+            # resolved by whichever the glob visited last - a silent coin toss.
+            if [ -n "${seen_goarm64-}" ] && [ "$seen_goarm64" != "$goarm64" ]; then
+              echo "FAIL: two profiles build ${{ matrix.arch }} with different GOARM64 ($seen_goarm64 vs $goarm64)" >&2
+              exit 1
+            fi
+            seen_goarm64=$goarm64
+
+            echo "GOARM64=$goarm64" >> "$GITHUB_ENV"
+            echo "$p: wired for ${{ matrix.arch }} (GOARM64=$goarm64)"
+          done
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:

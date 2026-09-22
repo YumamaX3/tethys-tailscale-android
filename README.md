@@ -33,8 +33,9 @@ devices/
 docs/
   PROVENANCE.md          every constant, its source URL, and the sha256 read
 tools/
-  split-android-patch.mjs   the regenerator (declarative, deterministic)
-  patch-groups.json         group definitions consumed by the splitter
+  split-android-patch.mjs      the regenerator (declarative, deterministic)
+  patch-groups.json            group definitions consumed by the splitter
+  check-device-profile.sh      proves each profile is inert, complete, and agrees with the build
 ```
 
 ## The series
@@ -118,12 +119,32 @@ confirmed** against `Fwmark.h`, which was fetched before that comment was read.
 The module that consumes this series lives in `tethys-tailscaled-module`. It
 needs no copy of this patch series — only the binary this series produces.
 
-**Open debt, named rather than hidden:** `devices/pixel6pro.env` carries both
-build-time and runtime keys, while the module carries its own runtime defaults in
-`config.env`. The two are *reconciled by hand today*. A CI step that emits the
-profile's runtime keys into the module zip — or proves the two agree — is owed.
-Until it exists, treat the module's `config.env` as the runtime authority and
-this profile as the build authority, and change a runtime value in **both**.
+**The build half is now wired, and mechanically checked.** The workflow's *Wire
+every device profile that builds this arch* step runs
+`tools/check-device-profile.sh` and then sources every profile whose
+`TETHYS_GOARCH` matches the leg being built, exporting its toolchain knobs into
+`$GITHUB_ENV`. So the profile is no longer a document of intent: the NDK version
+it names is re-read out of patch 0001, its CGO decision is re-derived from the
+workflow's own invocation, its ABI is checked against its own `GOARCH`, and its
+arch is checked against the matrix. Any drift fails the run rather than shipping
+a silently wrong binary.
+
+`check-device-profile.sh` also proves the profile is **inert** — sourced with an
+empty `PATH` under `set -u`, so a profile that shells out, or leans on a variable
+defined elsewhere, is caught instead of quietly expanding to nothing. A config
+that runs code is a program wearing a config's name.
+
+**The runtime half is not wired, and should not be.** The profile's runtime keys
+are the *daemon's* specification (plan M9 power governor, M10 MTU-derived MSS).
+The module parses a fixed 18-key schema and deliberately tunes no Go runtime from
+the shell: a knob the daemon owns cannot be measured from outside it, so setting
+it there would be a guess wearing a setting's name. Nothing in the module repo
+reads this file, and the profile's header now says so.
+
+**One debt survives, narrowed.** The profile and the module's `config.env` both
+name device-identity keys (`TETHYS_MATCH_*`), and those are still compared by
+hand. Proving *those* agree spans two repositories, so the check needs both trees
+present — it is owed, and named here rather than left to be rediscovered.
 
 ## Attribution and licence
 
